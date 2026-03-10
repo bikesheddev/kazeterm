@@ -1,6 +1,7 @@
 use gpui::*;
 use gpui_component::{h_flex, v_flex};
 use terminal::TerminalView;
+use themeing::SettingsStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
@@ -157,19 +158,18 @@ impl SplitPane {
           None
         }
       }
-      SplitPane::Split { first, second, .. } => {
-        first.find_pane_by_terminal_index(terminal_index, cx)
-          .or_else(|| second.find_pane_by_terminal_index(terminal_index, cx))
-      }
+      SplitPane::Split { first, second, .. } => first
+        .find_pane_by_terminal_index(terminal_index, cx)
+        .or_else(|| second.find_pane_by_terminal_index(terminal_index, cx)),
     }
   }
 
   pub fn find_terminal(&self, pane_id: PaneId) -> Option<Entity<TerminalView>> {
     match self {
       SplitPane::Terminal { id, terminal } if *id == pane_id => Some(terminal.clone()),
-      SplitPane::Split { first, second, .. } => {
-        first.find_terminal(pane_id).or_else(|| second.find_terminal(pane_id))
-      }
+      SplitPane::Split { first, second, .. } => first
+        .find_terminal(pane_id)
+        .or_else(|| second.find_terminal(pane_id)),
       _ => None,
     }
   }
@@ -201,10 +201,7 @@ impl SplitPane {
   ) -> AnyElement {
     match self {
       SplitPane::Terminal { id: _, terminal } => {
-        div()
-          .size_full()
-          .child(terminal.clone())
-          .into_any_element()
+        div().size_full().child(terminal.clone()).into_any_element()
       }
       SplitPane::Split {
         direction,
@@ -213,6 +210,7 @@ impl SplitPane {
         ratio,
       } => {
         let ratio = *ratio;
+        let colors = cx.global::<SettingsStore>().theme().colors().clone();
         match direction {
           SplitDirection::Horizontal => v_flex()
             .size_full()
@@ -222,12 +220,7 @@ impl SplitPane {
                 .size_full()
                 .child(first.render(active_pane_id, window, cx)),
             )
-            .child(
-              div()
-                .h_1()
-                .w_full()
-                .bg(gpui::rgb(0x3a3a3a)),
-            )
+            .child(div().h_1().w_full().bg(colors.border_variant))
             .child(
               div()
                 .flex_basis(relative(1.0 - ratio))
@@ -243,12 +236,7 @@ impl SplitPane {
                 .size_full()
                 .child(first.render(active_pane_id, window, cx)),
             )
-            .child(
-              div()
-                .w_1()
-                .h_full()
-                .bg(gpui::rgb(0x3a3a3a)),
-            )
+            .child(div().w_1().h_full().bg(colors.border_variant))
             .child(
               div()
                 .flex_basis(relative(1.0 - ratio))
@@ -369,7 +357,9 @@ impl SplitContainer {
   }
 
   pub fn get_active_terminal(&self) -> Option<Entity<TerminalView>> {
-    self.active_pane_id.and_then(|id| self.root.find_terminal(id))
+    self
+      .active_pane_id
+      .and_then(|id| self.root.find_terminal(id))
   }
 
   #[allow(dead_code)]
