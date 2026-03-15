@@ -1,8 +1,15 @@
 use std::{cmp, collections::VecDeque, process::ExitStatus, sync::Arc};
 
 use crate::{
-  TerminalBounds, indexed_cell::IndexedCell, mouse::grid_point_and_side, pty_info::PtyProcessInfo,
-  terminal_content::TerminalContent, terminal_hyperlinks::RegexSearches,
+  TerminalBounds, indexed_cell::IndexedCell,
+  kitty_graphics::{
+    ImagePlacement, KittyAction, KittyCommand, KittyDelete, KittyImageStorage, KittyParser,
+    PlacementManager, RawGraphicsCommand,
+  },
+  mouse::grid_point_and_side,
+  pty_info::PtyProcessInfo,
+  terminal_content::TerminalContent,
+  terminal_hyperlinks::RegexSearches,
 };
 use alacritty_terminal::{
   Term,
@@ -73,6 +80,13 @@ pub struct Terminal {
   /// Tracks the last time the user sent input (keystrokes/paste) to the terminal.
   /// Used to determine if a bell follows a long-running command.
   pub last_input_time: std::time::Instant,
+  /// Kitty graphics protocol state.
+  graphics_rx: Option<std::sync::mpsc::Receiver<RawGraphicsCommand>>,
+  graphics_parser: KittyParser,
+  pub image_storage: KittyImageStorage,
+  pub placement_manager: PlacementManager,
+  /// Shared atomic for signaling cursor advancement to the PTY filter.
+  pending_cnl: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl Terminal {
@@ -80,6 +94,8 @@ impl Terminal {
     pty_tx: EventLoopSender,
     term: Arc<FairMutex<Term<TerminalEventListener>>>,
     pty_info: PtyProcessInfo,
+    graphics_rx: Option<std::sync::mpsc::Receiver<RawGraphicsCommand>>,
+    pending_cnl: Option<Arc<std::sync::atomic::AtomicU32>>,
   ) -> Self {
     Self {
       pty_tx: Notifier(pty_tx),
@@ -102,6 +118,11 @@ impl Terminal {
       last_scroll_time: None,
       touch_state: None,
       last_input_time: std::time::Instant::now(),
+      graphics_rx,
+      graphics_parser: KittyParser::new(),
+      image_storage: KittyImageStorage::new(),
+      placement_manager: PlacementManager::new(),
+      pending_cnl,
     }
   }
 
@@ -149,6 +170,175 @@ impl Terminal {
       self.process_terminal_event(&e, &mut terminal, window, cx)
     }
     self.last_content = Self::make_content(&terminal, &self.last_content);
+
+    let history_size = terminal.history_size() as i32;
+    let display_offset = self.last_content.display_offset as i32;
+    drop(terminal);
+
+    // Process graphics commands AFTER terminal events so terminal_bounds is up to date.
+    self.process_graphics_commands();
+
+    // Collect visible image placements for rendering.
+    let viewport_top = history_size - display_offset;
+    let viewport_lines = self.last_content.terminal_bounds.screen_lines() as u32;
+
+    self.last_content.image_placements = self.placement_manager.visible_placements(
+      &self.image_storage,
+      viewport_top,
+      viewport_lines,
+    );
+  }
+
+  fn process_graphics_commands(&mut self) {
+    // Drain all available graphics commands (non-blocking).
+    let mut raw_commands: Vec<RawGraphicsCommand> = Vec::new();
+    if let Some(rx) = &self.graphics_rx {
+      while let Ok(raw_cmd) = rx.try_recv() {
+        raw_commands.push(raw_cmd);
+      }
+    }
+
+    for raw_cmd in raw_commands {
+      if raw_cmd.clear_all {
+        self.placement_manager.clear();
+        self.image_storage.clear();
+        continue;
+      }
+      let cursor_line = raw_cmd.cursor_line;
+      let cursor_column = raw_cmd.cursor_column;
+      if let Some(cmd) = self.graphics_parser.parse(&raw_cmd.data) {
+        self.execute_graphics_command(&cmd, cursor_line, cursor_column);
+      }
+    }
+    // Note: Kitty protocol responses are intentionally NOT sent back.
+    // Our architecture intercepts APC on the read side, so write_to_pty
+    // would send responses to the shell's stdin (appearing as typed text).
+    // Tools like kitten icat use q=2 (suppress all) and handle timeouts.
+  }
+
+  fn execute_graphics_command(
+    &mut self,
+    cmd: &KittyCommand,
+    cursor_line: i32,
+    cursor_column: i32,
+  ) {
+    match cmd.action {
+      KittyAction::Transmit => {
+        let _ = self.image_storage.store(cmd);
+      }
+      KittyAction::TransmitAndDisplay => {
+        if let Ok(id) = self.image_storage.store(cmd) {
+          self.place_image(id, cmd, cursor_line, cursor_column);
+        }
+      }
+      KittyAction::Display => {
+        let image_id = cmd.image_id;
+        if self.image_storage.get(image_id).is_some() {
+          self.place_image(image_id, cmd, cursor_line, cursor_column);
+        }
+      }
+      KittyAction::Delete => {
+        self.handle_delete(cmd);
+      }
+      KittyAction::Query => {
+        // We support the protocol but can't send responses back
+        // without them leaking to the shell's stdin.
+      }
+    }
+  }
+
+  fn place_image(
+    &mut self,
+    image_id: u32,
+    cmd: &KittyCommand,
+    cursor_line: i32,
+    cursor_column: i32,
+  ) {
+    // Use cursor position captured at APC intercept time (not current cursor).
+    let line = cursor_line;
+    let column = cursor_column;
+
+    // Determine display size in cells.
+    let (width_cells, height_cells) = if cmd.display_columns > 0 && cmd.display_rows > 0 {
+      (cmd.display_columns, cmd.display_rows)
+    } else if let Some(img) = self.image_storage.peek(image_id) {
+      // Scale to fit terminal width, preserving aspect ratio.
+      let bounds = &self.last_content.terminal_bounds;
+      let cw = f32::from(bounds.cell_width().max(gpui::px(1.0))) as u32;
+      let lh = f32::from(bounds.line_height().max(gpui::px(1.0))) as u32;
+      let terminal_cols = bounds.num_columns() as u32;
+      let terminal_width_px = terminal_cols.saturating_mul(cw).max(1);
+
+      if img.width > terminal_width_px {
+        // Image wider than terminal — scale down to fit.
+        let h_px =
+          ((img.height as u64 * terminal_width_px as u64) / img.width.max(1) as u64) as u32;
+        let h_cells = (h_px + lh - 1) / lh;
+        (terminal_cols.max(1), h_cells.max(1))
+      } else {
+        // Image fits — use native pixel size.
+        let w = (img.width + cw - 1) / cw;
+        let h = (img.height + lh - 1) / lh;
+        (w.max(1), h.max(1))
+      }
+    } else {
+      (1, 1)
+    };
+
+    self.placement_manager.add(ImagePlacement {
+      image_id,
+      placement_id: cmd.placement_id,
+      line,
+      column,
+      width_cells,
+      height_cells,
+      crop: (cmd.crop_x, cmd.crop_y, cmd.crop_width, cmd.crop_height),
+      z_index: cmd.z_index,
+      x_offset: cmd.x_offset,
+      y_offset: cmd.y_offset,
+    });
+
+    // Signal the PTY filter to inject cursor advancement on next read.
+    // This is the fallback mechanism for when the filter couldn't compute
+    // the height from APC params alone (e.g., PNG without r=/v=).
+    if let Some(cnl) = &self.pending_cnl {
+      cnl.store(height_cells, std::sync::atomic::Ordering::Release);
+    }
+  }
+
+  fn handle_delete(&mut self, cmd: &KittyCommand) {
+    let delete = cmd.delete.as_ref().cloned().unwrap_or(KittyDelete::All);
+    match delete {
+      KittyDelete::All => {
+        self.placement_manager.clear();
+        self.image_storage.clear();
+      }
+      KittyDelete::ById {
+        image_id: _,
+        placement_id,
+      } => {
+        let id = cmd.image_id;
+        self.placement_manager.remove_by_id(id, placement_id);
+        if placement_id.is_none() {
+          self.image_storage.remove(id);
+        }
+      }
+      KittyDelete::AtCursor => {
+        let term = self.term.lock_unfair();
+        let cursor = term.renderable_content().cursor;
+        let history_size = term.history_size() as i32;
+        let line = history_size + cursor.point.line.0;
+        let col = cursor.point.column.0 as i32;
+        self.placement_manager.remove_at_cursor(line, col);
+      }
+      KittyDelete::ByZIndex(_) | KittyDelete::AtColumn(_) | KittyDelete::AtRow(_) => {
+        // Simplified: just remove all for these advanced cases.
+        self.placement_manager.clear();
+      }
+      KittyDelete::AnimationFrames => {
+        // Not supported in MVP.
+      }
+    }
   }
 
   fn make_content(
@@ -186,6 +376,7 @@ impl Terminal {
       scrolled_to_bottom: content.display_offset == 0,
       search_matches: last_content.search_matches.clone(),
       current_search_match_index: last_content.current_search_match_index,
+      image_placements: Vec::new(),
     }
   }
 

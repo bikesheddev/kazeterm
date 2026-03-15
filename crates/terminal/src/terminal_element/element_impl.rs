@@ -164,8 +164,10 @@ impl Element for TerminalElement {
           current_search_match_index,
           last_hovered_word,
           history_size,
+          image_placements,
           ..
         } = &self.terminal.read(cx).last_content;
+        let image_placements = image_placements.clone();
 
         let mode = *mode;
         let display_offset = *display_offset;
@@ -322,6 +324,7 @@ impl Element for TerminalElement {
           minimap_state,
           minimap_bounds,
           minimap_cells,
+          image_placements,
         }
       },
     )
@@ -383,6 +386,14 @@ impl Element for TerminalElement {
             rect.paint(origin, &layout.dimensions, window);
           }
 
+          // Paint Kitty graphics images with negative z-index (behind text).
+          for placement in &layout.image_placements {
+            if placement.z_index >= 0 {
+              continue;
+            }
+            paint_image_placement(placement, origin, &layout.dimensions, window);
+          }
+
           for (relative_highlighted_range, color) in layout.relative_highlighted_ranges.iter() {
             if let Some((start_y, highlighted_range_lines)) =
               to_highlighted_range_lines(relative_highlighted_range, layout, origin)
@@ -438,6 +449,14 @@ impl Element for TerminalElement {
             && let Some(mut cursor) = original_cursor
           {
             cursor.paint(origin, window, cx);
+          }
+
+          // Paint Kitty graphics images with non-negative z-index (on top of text).
+          for placement in &layout.image_placements {
+            if placement.z_index < 0 {
+              continue;
+            }
+            paint_image_placement(placement, origin, &layout.dimensions, window);
           }
         },
       );
@@ -600,4 +619,31 @@ impl Element for TerminalElement {
       }
     });
   }
+}
+
+/// Paint a single Kitty graphics image placement at its grid position.
+fn paint_image_placement(
+  placement: &crate::kitty_graphics::VisiblePlacement,
+  origin: Point<Pixels>,
+  dimensions: &TerminalBounds,
+  window: &mut Window,
+) {
+  let x = origin.x
+    + placement.column as f32 * dimensions.cell_width()
+    + gpui::px(placement.x_offset as f32);
+  let y = origin.y
+    + placement.viewport_line as f32 * dimensions.line_height()
+    + gpui::px(placement.y_offset as f32);
+  let w = placement.width_cells as f32 * dimensions.cell_width();
+  let h = placement.height_cells as f32 * dimensions.line_height();
+
+  let img_bounds = Bounds::new(Point::new(x, y), gpui::Size { width: w, height: h });
+
+  let _ = window.paint_image(
+    img_bounds,
+    gpui::Corners::default(),
+    placement.render_image.clone(),
+    0,
+    false,
+  );
 }

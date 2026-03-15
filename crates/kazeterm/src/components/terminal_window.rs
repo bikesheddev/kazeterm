@@ -1,6 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
-use alacritty_terminal::{Term, event_loop::EventLoop, sync::FairMutex, term::Config};
+use alacritty_terminal::{
+  Term, event_loop::EventLoop, grid::Dimensions, sync::FairMutex, term::Config,
+};
 use futures::{FutureExt, StreamExt as _, channel::mpsc::unbounded};
 use gpui::{AppContext, Context, Entity};
 
@@ -52,21 +54,59 @@ fn new_terminal(
 
   let pty =
     alacritty_terminal::tty::new(&pty_options, TerminalBounds::default().into(), 1).unwrap();
-  let pty_info = PtyProcessInfo::new(&pty);
 
-  let event_loop = EventLoop::new(
-    term.clone(),
-    TerminalEventListener(events_tx),
-    pty,
-    pty_options.drain_on_exit,
-    false,
-  )
-  .unwrap();
+  #[cfg(unix)]
+  let (pty_tx, pty_info, graphics_rx, pending_cnl) = {
+    use terminal::kitty_graphics::GraphicsPtyFilter;
 
-  let pty_tx = event_loop.channel();
-  let _io_thread = event_loop.spawn();
+    let term_for_cursor = term.clone();
+    let cursor_fn: Box<dyn Fn() -> Option<(i32, i32)> + Send + Sync> =
+      Box::new(move || {
+        let t = term_for_cursor.try_lock_unfair()?;
+        let cursor = t.grid().cursor.point;
+        let hs = t.history_size() as i32;
+        Some((hs + cursor.line.0, cursor.column.0 as i32))
+      });
 
-  let terminal = terminal::Terminal::new(pty_tx, term, pty_info);
+    let (filter, pending_cnl, graphics_rx) =
+      GraphicsPtyFilter::new(pty, cursor_fn).unwrap();
+    let pty_info = PtyProcessInfo::from_raw(filter.pty_fd(), filter.child_pid());
+
+    let event_loop = EventLoop::new(
+      term.clone(),
+      TerminalEventListener(events_tx),
+      filter,
+      pty_options.drain_on_exit,
+      false,
+    )
+    .unwrap();
+
+    let pty_tx = event_loop.channel();
+    let _io_thread = event_loop.spawn();
+
+    (pty_tx, pty_info, Some(graphics_rx), Some(pending_cnl))
+  };
+
+  #[cfg(not(unix))]
+  let (pty_tx, pty_info, graphics_rx, pending_cnl) = {
+    let pty_info = PtyProcessInfo::new(&pty);
+
+    let event_loop = EventLoop::new(
+      term.clone(),
+      TerminalEventListener(events_tx),
+      pty,
+      pty_options.drain_on_exit,
+      false,
+    )
+    .unwrap();
+
+    let pty_tx = event_loop.channel();
+    let _io_thread = event_loop.spawn();
+
+    (pty_tx, pty_info, None, None)
+  };
+
+  let terminal = terminal::Terminal::new(pty_tx, term, pty_info, graphics_rx, pending_cnl);
 
   (terminal, events_rx)
 }
