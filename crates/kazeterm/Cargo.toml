@@ -30,17 +30,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 notify.workspace = true
 notify-debouncer-mini.workspace = true
-# notify-rust pulls in mac-notification-sys on macOS which causes a
-# "select application" dialog.  On macOS we use native APIs instead.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-notify-rust = { workspace = true }
-which = "7"
-
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 raw-window-handle = "0.6"
 
+# Use native notification APIs on macOS and Windows.
+# notify-rust is only needed on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { workspace = true }
+which = "7"
 raw-window-handle = "0.6"
 x11rb = "0.13"
 image = { workspace = true }

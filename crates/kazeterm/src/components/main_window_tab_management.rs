@@ -299,12 +299,16 @@ impl MainWindow {
           Self::send_notification_osascript(body);
         }
       }
-      #[cfg(not(target_os = "macos"))]
+      #[cfg(target_os = "linux")]
       {
         let _ = notify_rust::Notification::new()
           .summary("Kazeterm")
           .body(&format!("{body}"))
           .show();
+      }
+      #[cfg(target_os = "windows")]
+      {
+        Self::send_notification_windows(body);
       }
     });
   }
@@ -368,6 +372,48 @@ impl MainWindow {
     let _ = std::process::Command::new("osascript")
       .args(["-e", &script])
       .output();
+  }
+
+  #[cfg(target_os = "windows")]
+  fn send_notification_windows(body: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+
+    // Use PowerShell's AUMID — it is always registered on Windows, so
+    // CreateToastNotifierWithId works without any shortcut or registry setup.
+    const POWERSHELL_AUMID: &str =
+      "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+    unsafe {
+      let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+
+    let escaped = body
+      .replace('&', "&amp;")
+      .replace('<', "&lt;")
+      .replace('>', "&gt;")
+      .replace('"', "&quot;");
+    let xml = format!(
+      r#"<toast><visual><binding template="ToastGeneric"><text>Kazeterm</text><text>{escaped}</text></binding></visual></toast>"#
+    );
+
+    let Ok(doc) = XmlDocument::new() else { return };
+    if doc.LoadXml(&HSTRING::from(&xml)).is_err() {
+      return;
+    }
+    let Ok(toast) = ToastNotification::CreateToastNotification(&doc) else {
+      return;
+    };
+    let Ok(notifier) =
+      ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+        POWERSHELL_AUMID,
+      ))
+    else {
+      return;
+    };
+    let _ = notifier.Show(&toast);
   }
 
   pub(crate) fn play_bell_sound(&self) {
