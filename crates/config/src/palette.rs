@@ -209,7 +209,13 @@ impl Default for Palette {
     Palette {
       border,
       border_variant,
-      border_focused: accent,
+      border_focused: {
+        // Derive from accent: reduce saturation and shift lightness toward grey
+        let mut c = accent;
+        c.s *= 0.5;
+        c.l = c.l * 0.8 + 0.5 * 0.2;
+        c
+      },
       border_selected: accent,
       border_transparent,
       border_disabled,
