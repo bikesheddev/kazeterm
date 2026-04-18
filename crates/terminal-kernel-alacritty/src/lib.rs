@@ -1,11 +1,17 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Osc52;
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
 use futures::{channel::mpsc::UnboundedReceiver, channel::mpsc::unbounded};
-use terminal::{PtyProcessInfo, Terminal, TerminalBounds, TerminalEventListener};
+use terminal::{PtyProcessInfo, PtySender, Terminal, TerminalBounds, TerminalEventListener};
 use terminal_kernel::{
-  SessionEvents, Term, event_loop::EventLoop, sync::FairMutex, term::Config, tty,
+  AlacrittyBackend, SessionEvents, Term,
+  event::WindowSize,
+  event_loop::{EventLoop, EventLoopSender, Msg},
+  sync::FairMutex,
+  term::Config,
+  tty,
 };
 
 #[cfg(unix)]
@@ -14,6 +20,21 @@ use terminal::kitty_graphics::GraphicsPtyFilter;
 use terminal::kitty_graphics::{WindowsDsrCursorFn, WindowsDsrFilter};
 #[cfg(unix)]
 use terminal_kernel::grid::Dimensions as _;
+
+/// PtySender implementation wrapping alacritty's EventLoopSender.
+pub struct AlacrittyPtySender(EventLoopSender);
+
+impl PtySender for AlacrittyPtySender {
+  fn send_input(&self, bytes: Cow<'static, [u8]>) {
+    if !bytes.is_empty() {
+      let _ = self.0.send(Msg::Input(bytes));
+    }
+  }
+
+  fn send_resize(&self, size: WindowSize) {
+    let _ = self.0.send(Msg::Resize(size));
+  }
+}
 
 fn parse_cursor_style(config: &config::Config) -> CursorStyle {
   let shape = match config.cursor.shape.as_str() {
@@ -51,6 +72,10 @@ pub fn create_terminal_session(
   }
 
   env.insert("TERM_PROGRAM".to_string(), "kazeterm".to_string());
+  env.insert(
+    "TERM_PROGRAM_VERSION".to_string(),
+    env!("CARGO_PKG_VERSION").to_string(),
+  );
   env.insert("TERM".to_string(), "xterm-256color".to_string());
   env.insert("COLORTERM".to_string(), "truecolor".to_string());
 
@@ -224,9 +249,10 @@ pub fn create_terminal_session(
     (pty_tx, pty_info, None, None, None)
   };
 
+  let backend = AlacrittyBackend::new(term);
   let terminal = Terminal::new(
-    pty_tx,
-    term,
+    Box::new(AlacrittyPtySender(pty_tx)),
+    Box::new(backend),
     pty_info,
     graphics_rx,
     pending_cnl,
