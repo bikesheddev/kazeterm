@@ -313,7 +313,7 @@ impl TerminalKernel {
   pub fn is_supported_on_current_platform(self) -> bool {
     match self {
       Self::Alacritty => true,
-      Self::Ghostty => cfg!(any(target_os = "linux", target_os = "macos")),
+      Self::Ghostty => true,
       Self::Vte => cfg!(target_os = "linux"),
     }
   }
@@ -331,7 +331,7 @@ impl TerminalKernel {
 
     #[cfg(target_os = "windows")]
     {
-      &["alacritty"]
+      &["alacritty", "ghostty"]
     }
   }
 
@@ -1060,7 +1060,7 @@ kernel = "vte"
         r#"version = "{}"
 
 [terminal]
-kernel = "ghostty"
+kernel = "vte"
 "#,
         CURRENT_CONFIG_VERSION,
       ),
@@ -1069,7 +1069,7 @@ kernel = "ghostty"
 
     let error = Config::load_from_path(&base_path).unwrap_err().to_string();
 
-    assert!(error.contains("Terminal kernel 'ghostty' is not available on this platform"));
+    assert!(error.contains("Terminal kernel 'vte' is not available on this platform"));
 
     std::fs::remove_dir_all(dir).unwrap();
   }

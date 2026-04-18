@@ -4,16 +4,19 @@
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
+use std::time::Duration;
 
 use parking_lot::Mutex;
-use terminal_kernel::event::WindowSize;
+use terminal_kernel::event::{OnResize, WindowSize};
 use terminal_kernel::index::{Column, Line, Point as AlacPoint};
 use terminal_kernel::term::TermMode;
 use terminal_kernel::term::cell::{Cell, Flags as CellFlags};
+use terminal_kernel::tty::{ChildEvent, EventedPty, EventedReadWrite};
 use terminal_kernel::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Rgb};
 
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, RowIterator};
+use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
@@ -31,30 +34,31 @@ pub enum GhosttyMsg {
 pub type GhosttyMsgSender = std::sync::mpsc::Sender<GhosttyMsg>;
 
 /// Event loop that owns a ghostty `Terminal` (which is `!Send + !Sync`) and
-/// drives it from a dedicated thread.  PTY I/O and channel messages are
+/// drives it from a dedicated thread. PTY I/O and channel messages are
 /// interleaved using non-blocking reads.
 pub struct GhosttyEventLoop {
   tx: GhosttyMsgSender,
   rx: std::sync::mpsc::Receiver<GhosttyMsg>,
-  pty_reader: std::fs::File,
-  pty_writer: std::fs::File,
+  pty: terminal_kernel::tty::Pty,
   state: Arc<Mutex<GhosttyTermInner>>,
   event_tx: futures::channel::mpsc::UnboundedSender<terminal_kernel::event::Event>,
   #[cfg(unix)]
   pty_raw_fd: i32,
-  /// Keeps the child process alive for the lifetime of the event loop.
-  _pty: terminal_kernel::tty::Pty,
   /// Initial terminal dimensions.
   initial_cols: u16,
   initial_rows: u16,
   max_scrollback: usize,
 }
 
+enum PtyReadStatus {
+  Data(usize),
+  WouldBlock,
+  Eof,
+}
+
 impl GhosttyEventLoop {
   pub fn new(
     pty: terminal_kernel::tty::Pty,
-    pty_reader: std::fs::File,
-    pty_writer: std::fs::File,
     state: Arc<Mutex<GhosttyTermInner>>,
     event_tx: futures::channel::mpsc::UnboundedSender<terminal_kernel::event::Event>,
     #[cfg(unix)] pty_raw_fd: i32,
@@ -66,13 +70,11 @@ impl GhosttyEventLoop {
     Self {
       tx,
       rx,
-      pty_reader,
-      pty_writer,
+      pty,
       state,
       event_tx,
       #[cfg(unix)]
       pty_raw_fd,
-      _pty: pty,
       initial_cols,
       initial_rows,
       max_scrollback,
@@ -92,6 +94,96 @@ impl GhosttyEventLoop {
         self.run();
       })
       .expect("spawn ghostty event loop")
+  }
+
+  fn read_pty(&mut self, buf: &mut [u8]) -> io::Result<PtyReadStatus> {
+    let read_result = self.pty.reader().read(buf);
+    match read_result {
+      Ok(0) => {
+        #[cfg(windows)]
+        {
+          return Ok(match self.pty.next_child_event() {
+            Some(ChildEvent::Exited(_)) => PtyReadStatus::Eof,
+            None => PtyReadStatus::WouldBlock,
+          });
+        }
+
+        #[cfg(not(windows))]
+        {
+          Ok(PtyReadStatus::Eof)
+        }
+      }
+      Ok(n) => Ok(PtyReadStatus::Data(n)),
+      Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(PtyReadStatus::WouldBlock),
+      Err(error) => {
+        #[cfg(windows)]
+        {
+          return match self.pty.next_child_event() {
+            Some(ChildEvent::Exited(_)) => Ok(PtyReadStatus::Eof),
+            None => Err(error),
+          };
+        }
+
+        #[cfg(not(windows))]
+        {
+          Err(error)
+        }
+      }
+    }
+  }
+
+  fn write_pty(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+      let write_result = self.pty.writer().write(bytes);
+      match write_result {
+        Ok(0) => {
+          #[cfg(windows)]
+          {
+            if matches!(self.pty.next_child_event(), Some(ChildEvent::Exited(_))) {
+              return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pty exited"));
+            }
+
+            thread::sleep(Duration::from_millis(1));
+            continue;
+          }
+
+          #[cfg(not(windows))]
+          {
+            return Err(io::Error::new(
+              io::ErrorKind::WriteZero,
+              "pty write returned zero bytes",
+            ));
+          }
+        }
+        Ok(written) => {
+          bytes = &bytes[written..];
+        }
+        Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
+          thread::sleep(Duration::from_millis(1));
+        }
+        Err(error) => {
+          #[cfg(windows)]
+          {
+            if matches!(self.pty.next_child_event(), Some(ChildEvent::Exited(_))) {
+              return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pty exited"));
+            }
+          }
+
+          return Err(error);
+        }
+      }
+    }
+
+    self.pty.writer().flush()
+  }
+
+  fn drain_pty_writebacks(&mut self, pty_write_rx: &Receiver<Vec<u8>>) -> io::Result<()> {
+    loop {
+      match pty_write_rx.try_recv() {
+        Ok(bytes) => self.write_pty(&bytes)?,
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(()),
+      }
+    }
   }
 
   fn run(mut self) {
@@ -133,59 +225,43 @@ impl GhosttyEventLoop {
       }
     };
 
-    let mut row_iter = match RowIterator::new() {
-      Ok(r) => r,
-      Err(e) => {
-        eprintln!("ghostty: failed to create row iterator: {e:?}");
-        return;
-      }
-    };
+    let (pty_write_tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-    let mut cell_iter = match CellIterator::new() {
-      Ok(c) => c,
-      Err(e) => {
-        eprintln!("ghostty: failed to create cell iterator: {e:?}");
-        return;
-      }
-    };
-
-    // Wire up PTY write-back for query responses.
+    // Queue PTY write-back for query responses so the loop can flush them using
+    // the platform-specific PTY writer it already owns.
     {
-      let mut writer = self
-        .pty_writer
-        .try_clone()
-        .expect("clone pty writer for ghostty effect");
-      let _ = terminal.on_pty_write(move |_term, data| {
-        let _ = writer.write_all(data);
-        let _ = writer.flush();
-      });
+      let pty_write_tx = pty_write_tx.clone();
+      if let Err(error) = terminal.on_pty_write(move |_term, data| {
+        let _ = pty_write_tx.send(data.to_vec());
+      }) {
+        eprintln!("ghostty: failed to register PTY write callback: {error:?}");
+      }
     }
 
     // Bell → alacritty Bell event.
     {
       let event_tx = self.event_tx.clone();
-      let _ = terminal.on_bell(move |_term| {
+      if let Err(error) = terminal.on_bell(move |_term| {
         let _ = event_tx.unbounded_send(terminal_kernel::event::Event::Bell);
-      });
-    }
-
-    // Title changed → alacritty Title event.
-    {
-      let event_tx = self.event_tx.clone();
-      let _ = terminal.on_title_changed(move |term| {
-        let title = term.title().unwrap_or("").to_string();
-        let _ = event_tx.unbounded_send(terminal_kernel::event::Event::Title(title));
-      });
+      }) {
+        eprintln!("ghostty: failed to register bell callback: {error:?}");
+      }
     }
 
     // XTVERSION → respond with kazeterm identification.
     {
-      let _ = terminal.on_xtversion(|_term| Some(concat!("kazeterm ", env!("CARGO_PKG_VERSION"))));
+      if let Err(error) =
+        terminal.on_xtversion(|_term| Some(concat!("kazeterm ", env!("CARGO_PKG_VERSION"))))
+      {
+        eprintln!("ghostty: failed to register xtversion callback: {error:?}");
+      }
     }
 
     // ENQ → respond with empty string (standard).
     {
-      let _ = terminal.on_enquiry(|_term| Some(""));
+      if let Err(error) = terminal.on_enquiry(|_term| Some("")) {
+        eprintln!("ghostty: failed to register enquiry callback: {error:?}");
+      }
     }
 
     // Device attributes → respond as VT220-compatible terminal.
@@ -194,7 +270,7 @@ impl GhosttyEventLoop {
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
         PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
       };
-      let _ = terminal.on_device_attributes(|_term| {
+      if let Err(error) = terminal.on_device_attributes(|_term| {
         Some(DeviceAttributes {
           primary: PrimaryDeviceAttributes::new(
             ConformanceLevel::VT220,
@@ -211,17 +287,22 @@ impl GhosttyEventLoop {
           },
           tertiary: TertiaryDeviceAttributes { unit_id: 0 },
         })
-      });
+      }) {
+        eprintln!("ghostty: failed to register device attributes callback: {error:?}");
+      }
     }
 
     // Color scheme → report dark scheme.
     {
       use libghostty_vt::terminal::ColorScheme;
-      let _ = terminal.on_color_scheme(|_term| Some(ColorScheme::Dark));
+      if let Err(error) = terminal.on_color_scheme(|_term| Some(ColorScheme::Dark)) {
+        eprintln!("ghostty: failed to register color scheme callback: {error:?}");
+      }
     }
 
     // Track scrollback for delta computation.
     let mut prev_scrollback_count: usize = 0;
+    let mut last_title = String::new();
 
     let mut buf = [0u8; 4096];
 
@@ -230,52 +311,69 @@ impl GhosttyEventLoop {
       loop {
         match self.rx.try_recv() {
           Ok(GhosttyMsg::Input(bytes)) => {
-            let _ = self.pty_writer.write_all(&bytes);
-            let _ = self.pty_writer.flush();
+            if let Err(error) = self.write_pty(&bytes) {
+              eprintln!("ghostty: failed to write input to PTY: {error}");
+              sync_to_inner(
+                &terminal,
+                &mut render_state,
+                &self.state,
+                &mut prev_scrollback_count,
+              );
+              let _ = self
+                .event_tx
+                .unbounded_send(terminal_kernel::event::Event::Exit);
+              return;
+            }
           }
           Ok(GhosttyMsg::Resize(size)) => {
-            #[cfg(unix)]
-            {
-              let win = libc::winsize {
-                ws_row: size.num_lines,
-                ws_col: size.num_cols,
-                ws_xpixel: size.cell_width.saturating_mul(size.num_cols),
-                ws_ypixel: size.cell_height.saturating_mul(size.num_lines),
-              };
-              unsafe {
-                libc::ioctl(self.pty_raw_fd, libc::TIOCSWINSZ, &win as *const _);
-              }
-            }
-            let _ = terminal.resize(
+            self.pty.on_resize(size);
+            if let Err(error) = terminal.resize(
               size.num_cols,
               size.num_lines,
               size.cell_width as u32,
               size.cell_height as u32,
-            );
+            ) {
+              eprintln!("ghostty: failed to resize terminal: {error:?}");
+            }
             sync_to_inner(
               &terminal,
               &mut render_state,
-              &mut row_iter,
-              &mut cell_iter,
               &self.state,
               &mut prev_scrollback_count,
             );
+            emit_title_event_if_changed(&terminal, &self.event_tx, &mut last_title);
           }
-          Ok(GhosttyMsg::Shutdown) => return,
-          Err(std::sync::mpsc::TryRecvError::Empty) => break,
-          Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+          Ok(GhosttyMsg::Shutdown) => {
+            return;
+          }
+          Err(TryRecvError::Empty) => break,
+          Err(TryRecvError::Disconnected) => {
+            return;
+          }
         }
       }
 
+      if let Err(error) = self.drain_pty_writebacks(&pty_write_rx) {
+        eprintln!("ghostty: failed to flush PTY writeback: {error}");
+        sync_to_inner(
+          &terminal,
+          &mut render_state,
+          &self.state,
+          &mut prev_scrollback_count,
+        );
+        let _ = self
+          .event_tx
+          .unbounded_send(terminal_kernel::event::Event::Exit);
+        return;
+      }
+
       // Read from PTY (non-blocking on Unix).
-      match self.pty_reader.read(&mut buf) {
-        Ok(0) => {
+      match self.read_pty(&mut buf) {
+        Ok(PtyReadStatus::Eof) => {
           // EOF — child process exited.
           sync_to_inner(
             &terminal,
             &mut render_state,
-            &mut row_iter,
-            &mut cell_iter,
             &self.state,
             &mut prev_scrollback_count,
           );
@@ -284,29 +382,40 @@ impl GhosttyEventLoop {
             .unbounded_send(terminal_kernel::event::Event::Exit);
           return;
         }
-        Ok(n) => {
+        Ok(PtyReadStatus::Data(n)) => {
           terminal.vt_write(&buf[..n]);
+          if let Err(error) = self.drain_pty_writebacks(&pty_write_rx) {
+            eprintln!("ghostty: failed to flush PTY writeback: {error}");
+            sync_to_inner(
+              &terminal,
+              &mut render_state,
+              &self.state,
+              &mut prev_scrollback_count,
+            );
+            let _ = self
+              .event_tx
+              .unbounded_send(terminal_kernel::event::Event::Exit);
+            return;
+          }
           sync_to_inner(
             &terminal,
             &mut render_state,
-            &mut row_iter,
-            &mut cell_iter,
             &self.state,
             &mut prev_scrollback_count,
           );
+          emit_title_event_if_changed(&terminal, &self.event_tx, &mut last_title);
           let _ = self
             .event_tx
             .unbounded_send(terminal_kernel::event::Event::Wakeup);
         }
-        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-          thread::sleep(std::time::Duration::from_millis(2));
+        Ok(PtyReadStatus::WouldBlock) => {
+          thread::sleep(Duration::from_millis(2));
         }
-        Err(_) => {
+        Err(error) => {
+          eprintln!("ghostty: PTY read failed: {error}");
           sync_to_inner(
             &terminal,
             &mut render_state,
-            &mut row_iter,
-            &mut cell_iter,
             &self.state,
             &mut prev_scrollback_count,
           );
@@ -327,14 +436,15 @@ impl GhosttyEventLoop {
 fn sync_to_inner<'a>(
   terminal: &Terminal<'a, 'a>,
   render_state: &mut RenderState<'a>,
-  row_iter: &mut RowIterator<'a>,
-  cell_iter: &mut CellIterator<'a>,
   shared_state: &Arc<Mutex<GhosttyTermInner>>,
   prev_scrollback_count: &mut usize,
 ) {
   let snapshot = match render_state.update(terminal) {
     Ok(s) => s,
-    Err(_) => return,
+    Err(error) => {
+      eprintln!("ghostty: render state update failed: {error:?}");
+      return;
+    }
   };
 
   let num_cols = snapshot.cols().unwrap_or(80) as usize;
@@ -342,41 +452,41 @@ fn sync_to_inner<'a>(
 
   // Build visible rows.
   let mut visible_rows: Vec<Vec<Cell>> = Vec::with_capacity(num_rows);
+  for row_index in 0..num_rows {
+    let is_wrapped = terminal
+      .grid_ref(libghostty_vt::terminal::Point::Viewport(
+        libghostty_vt::terminal::PointCoordinate {
+          x: 0,
+          y: row_index as u32,
+        },
+      ))
+      .ok()
+      .and_then(|gr| gr.row().ok())
+      .and_then(|row| row.is_wrapped().ok())
+      .unwrap_or(false);
 
-  if let Ok(mut row_iteration) = row_iter.update(&snapshot) {
-    while let Some(row) = row_iteration.next() {
-      let mut row_cells = Vec::with_capacity(num_cols);
-
-      let is_wrapped = row
-        .raw_row()
+    let mut row_cells = Vec::with_capacity(num_cols);
+    for col_index in 0..num_cols {
+      let cell = terminal
+        .grid_ref(libghostty_vt::terminal::Point::Viewport(
+          libghostty_vt::terminal::PointCoordinate {
+            x: col_index as u16,
+            y: row_index as u32,
+          },
+        ))
         .ok()
-        .and_then(|r| r.is_wrapped().ok())
-        .unwrap_or(false);
-
-      if let Ok(mut cell_iteration) = cell_iter.update(&row) {
-        while let Some(cell) = cell_iteration.next() {
-          let alac_cell = convert_ghostty_cell(
-            &cell,
-            is_wrapped && row_cells.len() == num_cols.saturating_sub(1),
-          );
-          row_cells.push(alac_cell);
-        }
-      }
-
-      // Pad to num_cols if needed.
-      while row_cells.len() < num_cols {
-        row_cells.push(Cell::default());
-      }
-
-      // Mark last cell of wrapped rows.
-      if is_wrapped {
-        if let Some(last) = row_cells.last_mut() {
-          last.flags.insert(CellFlags::WRAPLINE);
-        }
-      }
-
-      visible_rows.push(row_cells);
+        .map(|gr| convert_grid_ref_to_cell(&gr))
+        .unwrap_or_default();
+      row_cells.push(cell);
     }
+
+    if is_wrapped {
+      if let Some(last) = row_cells.last_mut() {
+        last.flags.insert(CellFlags::WRAPLINE);
+      }
+    }
+
+    visible_rows.push(row_cells);
   }
 
   // Cursor.
@@ -410,7 +520,6 @@ fn sync_to_inner<'a>(
   if cursor_visible {
     mode.insert(TermMode::SHOW_CURSOR);
   }
-  // Check for alt screen mode via terminal query.
   if terminal
     .mode(libghostty_vt::terminal::Mode::ALT_SCREEN_SAVE)
     .unwrap_or(false)
@@ -508,73 +617,150 @@ fn sync_to_inner<'a>(
   );
 }
 
+fn emit_title_event_if_changed(
+  terminal: &Terminal<'_, '_>,
+  event_tx: &futures::channel::mpsc::UnboundedSender<terminal_kernel::event::Event>,
+  last_title: &mut String,
+) {
+  // libghostty only guarantees the updated title is readable after the
+  // title_changed callback returns, so query it after vt_write/sync instead.
+  let title = terminal.title().unwrap_or("").to_string();
+  if title != *last_title {
+    *last_title = title.clone();
+    let _ = event_tx.unbounded_send(terminal_kernel::event::Event::Title(title));
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use futures::{FutureExt as _, StreamExt as _, channel::mpsc::unbounded, executor::block_on};
+
+  use super::emit_title_event_if_changed;
+  use libghostty_vt::{Terminal, TerminalOptions};
+  use terminal_kernel::event::Event;
+
+  fn register_effects(terminal: &mut Terminal<'_, '_>) {
+    use libghostty_vt::terminal::{
+      ColorScheme, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+      PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
+    };
+
+    terminal
+      .on_pty_write(|_, _| {})
+      .expect("register on_pty_write");
+    terminal.on_bell(|_| {}).expect("register on_bell");
+    terminal
+      .on_xtversion(|_| Some(concat!("kazeterm ", env!("CARGO_PKG_VERSION"))))
+      .expect("register on_xtversion");
+    terminal
+      .on_enquiry(|_| Some(""))
+      .expect("register on_enquiry");
+    terminal
+      .on_device_attributes(|_| {
+        Some(DeviceAttributes {
+          primary: PrimaryDeviceAttributes::new(
+            ConformanceLevel::VT220,
+            [
+              DeviceAttributeFeature::COLUMNS_132,
+              DeviceAttributeFeature::SELECTIVE_ERASE,
+              DeviceAttributeFeature::ANSI_COLOR,
+            ],
+          ),
+          secondary: SecondaryDeviceAttributes {
+            device_type: DeviceType::VT220,
+            firmware_version: 1,
+            rom_cartridge: 0,
+          },
+          tertiary: TertiaryDeviceAttributes { unit_id: 0 },
+        })
+      })
+      .expect("register on_device_attributes");
+    terminal
+      .on_color_scheme(|_| Some(ColorScheme::Dark))
+      .expect("register on_color_scheme");
+  }
+
+  fn pwsh_title_block() -> &'static [u8] {
+    b"\x1b[?25l\x1b[2J\x1b[m\x1b[H\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\x1b[H\x1b]0;C:\\Program Files\\PowerShell\\7\\pwsh.exe\x07\x1b[?25h"
+  }
+
+  #[test]
+  fn emits_title_after_vt_write() {
+    let mut terminal = Terminal::new(TerminalOptions {
+      cols: 80,
+      rows: 24,
+      max_scrollback: 0,
+    })
+    .expect("ghostty terminal should initialize");
+    let (event_tx, mut event_rx) = unbounded();
+    let mut last_title = String::new();
+
+    terminal.vt_write(b"\x1b]2;Kazeterm Ghostty\x1b\\");
+    emit_title_event_if_changed(&terminal, &event_tx, &mut last_title);
+
+    assert_eq!(last_title, "Kazeterm Ghostty");
+    match block_on(event_rx.next()) {
+      Some(Event::Title(title)) => assert_eq!(title, "Kazeterm Ghostty"),
+      other => panic!("expected title event, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn skips_duplicate_title_events() {
+    let mut terminal = Terminal::new(TerminalOptions {
+      cols: 80,
+      rows: 24,
+      max_scrollback: 0,
+    })
+    .expect("ghostty terminal should initialize");
+    let (event_tx, mut event_rx) = unbounded();
+    let mut last_title = String::new();
+
+    terminal.vt_write(b"\x1b]2;Kazeterm Ghostty\x1b\\");
+    emit_title_event_if_changed(&terminal, &event_tx, &mut last_title);
+    emit_title_event_if_changed(&terminal, &event_tx, &mut last_title);
+
+    match block_on(event_rx.next()) {
+      Some(Event::Title(title)) => assert_eq!(title, "Kazeterm Ghostty"),
+      other => panic!("expected first title event, got {other:?}"),
+    }
+    assert!(event_rx.next().now_or_never().is_none());
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn vt_write_handles_windows_line_endings() {
+    let mut terminal = Terminal::new(TerminalOptions {
+      cols: 58,
+      rows: 26,
+      max_scrollback: 10_000,
+    })
+    .expect("ghostty terminal should initialize");
+
+    terminal.vt_write(b"\r");
+    terminal.vt_write(b"\n");
+    terminal.vt_write(b"\r\n");
+    terminal.vt_write(b"\r\n\r\n");
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn vt_write_handles_pwsh_startup_block_with_effects() {
+    let mut terminal = Terminal::new(TerminalOptions {
+      cols: 58,
+      rows: 26,
+      max_scrollback: 10_000,
+    })
+    .expect("ghostty terminal should initialize");
+
+    register_effects(&mut terminal);
+    terminal.vt_write(pwsh_title_block());
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Cell conversion helpers
 // ---------------------------------------------------------------------------
-
-/// Convert a ghostty render-state cell iteration entry to an alacritty `Cell`.
-fn convert_ghostty_cell(
-  cell: &libghostty_vt::render::CellIteration<'_, '_>,
-  _is_last_wrapped: bool,
-) -> Cell {
-  let mut alac_cell = Cell::default();
-
-  // Character.
-  let graphemes = cell.graphemes().unwrap_or_default();
-  if let Some(&ch) = graphemes.first() {
-    alac_cell.c = ch;
-  }
-
-  // Style.
-  if let Ok(style) = cell.style() {
-    // Foreground color.
-    alac_cell.fg = convert_style_color(&style.fg_color, true);
-    // Background color.
-    alac_cell.bg = convert_style_color(&style.bg_color, false);
-
-    // Flags.
-    if style.bold {
-      alac_cell.flags.insert(CellFlags::BOLD);
-    }
-    if style.italic {
-      alac_cell.flags.insert(CellFlags::ITALIC);
-    }
-    if style.faint {
-      alac_cell.flags.insert(CellFlags::DIM);
-    }
-    if style.inverse {
-      alac_cell.flags.insert(CellFlags::INVERSE);
-    }
-    if style.invisible {
-      alac_cell.flags.insert(CellFlags::HIDDEN);
-    }
-    if style.strikethrough {
-      alac_cell.flags.insert(CellFlags::STRIKEOUT);
-    }
-    match style.underline {
-      Underline::None => {}
-      Underline::Single => alac_cell.flags.insert(CellFlags::UNDERLINE),
-      Underline::Double => alac_cell.flags.insert(CellFlags::DOUBLE_UNDERLINE),
-      Underline::Curly => alac_cell.flags.insert(CellFlags::UNDERCURL),
-      Underline::Dotted => alac_cell.flags.insert(CellFlags::DOTTED_UNDERLINE),
-      Underline::Dashed => alac_cell.flags.insert(CellFlags::DASHED_UNDERLINE),
-      _ => {}
-    }
-  }
-
-  // Wide character flags.
-  if let Ok(raw) = cell.raw_cell() {
-    if let Ok(wide) = raw.wide() {
-      match wide {
-        CellWide::Wide => alac_cell.flags.insert(CellFlags::WIDE_CHAR),
-        CellWide::SpacerTail => alac_cell.flags.insert(CellFlags::WIDE_CHAR_SPACER),
-        _ => {}
-      }
-    }
-  }
-
-  alac_cell
-}
 
 /// Convert a ghostty `GridRef` (used for scrollback reads) to an alacritty `Cell`.
 fn convert_grid_ref_to_cell(gr: &libghostty_vt::screen::GridRef<'_>) -> Cell {
